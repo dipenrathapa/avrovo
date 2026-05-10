@@ -128,7 +128,30 @@ def metrics():
 # Public auth routes (no JWT needed)
 @app.api_route("/auth/{path:path}", methods=["GET", "POST"])
 async def auth_proxy(path: str, request: Request):
-    return await _forward(request, AUTH_URL, f"/{path}")
+    # return await _forward(request, AUTH_URL, f"/{path}")
+    return await _forward(request, AUTH_URL, f"/auth/{path}")
+
+
+
+
+
+# Public auth routes (no JWT needed)
+@app.api_route("/auth/{path:path}", methods=["GET", "POST"])
+async def auth_proxy(path: str, request: Request):
+    return await _forward(request, AUTH_URL, f"/auth/{path}")
+
+
+# Protected routes
+@app.api_route("/patients", methods=["GET", "POST"])
+async def patients_list_proxy(request: Request, _: dict = Depends(verify_jwt)):
+    return await _forward(request, PATIENT_URL, "/patients")
+
+
+
+
+
+
+
 
 
 # Protected routes

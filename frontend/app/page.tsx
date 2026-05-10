@@ -6,7 +6,7 @@ import { fetcher } from "../lib/api";
 type Patient = { id: string; name: string; age: number; conditions: string[] };
 
 export default function Home() {
-  const { data, error } = useSWR<Patient[]>("/patients/", fetcher);
+  const { data, error } = useSWR<Patient[]>("/patients", fetcher);
   return (
     <main style={{ maxWidth: 960, margin: "40px auto", padding: 16 }}>
       <h1 style={{ marginBottom: 4 }}>Avrovo</h1>

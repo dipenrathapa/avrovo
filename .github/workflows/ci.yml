@@ -119,11 +119,11 @@ jobs:
 
       - name: Run tests with coverage
         env:
-          PYTHONPATH: ${{ github.workspace }}
-          DATABASE_URL: sqlite+aiosqlite:///:memory:
-          JWT_SECRET: test-secret
-          JWT_PUBLIC_KEY: test-secret
-          KAFKA_BOOTSTRAP_SERVERS: localhost:9092
+          PYTHONPATH: "${{ github.workspace }}"
+          DATABASE_URL: "sqlite+aiosqlite:///:memory:"
+          JWT_SECRET: "test-secret"
+          JWT_PUBLIC_KEY: "test-secret"
+          KAFKA_BOOTSTRAP_SERVERS: "localhost:9092"
         working-directory: services/${{ matrix.service }}
         run: |
           pytest tests/ \
@@ -243,10 +243,10 @@ jobs:
 
       - name: Validate OpenAPI schemas can be generated
         env:
-          PYTHONPATH: ${{ github.workspace }}
-          DATABASE_URL: sqlite+aiosqlite:///:memory:
-          JWT_SECRET: test-secret
-          JWT_PUBLIC_KEY: test-secret
+          PYTHONPATH: "${{ github.workspace }}"
+          DATABASE_URL: "sqlite+aiosqlite:///:memory:"
+          JWT_SECRET: "test-secret"
+          JWT_PUBLIC_KEY: "test-secret"
         run: |
           for svc in api-gateway patient-service ai-engine auth-service notification-service; do
             echo "=== Checking $svc OpenAPI schema ==="

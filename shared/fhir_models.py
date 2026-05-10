@@ -1,4 +1,5 @@
 """FHIR-inspired Pydantic v2 models shared across services."""
+
 from __future__ import annotations
 
 from datetime import datetime
@@ -52,6 +53,7 @@ class MedicationRequest(BaseModel):
 
 class Observation(BaseModel):
     """LOINC-like coded measurement."""
+
     id: UUID = Field(default_factory=uuid4)
     patient_id: UUID
     code: str = Field(min_length=1, max_length=50)  # e.g. heart_rate, glucose, spo2
@@ -87,6 +89,7 @@ class AlertEvent(BaseModel):
 
 
 # --- Event envelope used on Kafka ---------------------------------------------
+
 
 class EventEnvelope(BaseModel):
     event_id: UUID = Field(default_factory=uuid4)

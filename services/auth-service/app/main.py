@@ -1,4 +1,5 @@
 """Auth service — JWT + RBAC + audit log. Argon2id password hashing."""
+
 from __future__ import annotations
 
 import os
@@ -84,9 +85,14 @@ async def db():
         yield s
 
 
-async def audit(s: AsyncSession, actor: str, action: str, target: str | None, ip: str | None):
+async def audit(
+    s: AsyncSession, actor: str, action: str, target: str | None, ip: str | None
+):
     import uuid
-    s.add(AuditRow(id=str(uuid.uuid4()), actor=actor, action=action, target=target, ip=ip))
+
+    s.add(
+        AuditRow(id=str(uuid.uuid4()), actor=actor, action=action, target=target, ip=ip)
+    )
     await s.commit()
 
 
@@ -103,25 +109,49 @@ def metrics():
 @app.post("/auth/signup", status_code=201)
 async def signup(body: SignupBody, request: Request, s: AsyncSession = Depends(db)):
     import uuid
-    existing = (await s.execute(select(UserRow).where(UserRow.email == body.email))).scalar_one_or_none()
+
+    existing = (
+        await s.execute(select(UserRow).where(UserRow.email == body.email))
+    ).scalar_one_or_none()
     if existing:
         raise HTTPException(409, "email taken")
     uid = str(uuid.uuid4())
-    s.add(UserRow(id=uid, email=body.email, password_hash=ph.hash(body.password), role=body.role.value))
+    s.add(
+        UserRow(
+            id=uid,
+            email=body.email,
+            password_hash=ph.hash(body.password),
+            role=body.role.value,
+        )
+    )
     await s.commit()
-    await audit(s, actor=uid, action="signup", target=body.email, ip=request.client.host if request.client else None)
+    await audit(
+        s,
+        actor=uid,
+        action="signup",
+        target=body.email,
+        ip=request.client.host if request.client else None,
+    )
     return {"id": uid, "email": body.email, "role": body.role.value}
 
 
 @app.post("/auth/login")
 async def login(body: LoginBody, request: Request, s: AsyncSession = Depends(db)):
-    user = (await s.execute(select(UserRow).where(UserRow.email == body.email))).scalar_one_or_none()
+    user = (
+        await s.execute(select(UserRow).where(UserRow.email == body.email))
+    ).scalar_one_or_none()
     if not user:
         raise HTTPException(401, "invalid credentials")
     try:
         ph.verify(user.password_hash, body.password)
     except VerifyMismatchError:
-        await audit(s, actor=user.id, action="login_fail", target=body.email, ip=request.client.host if request.client else None)
+        await audit(
+            s,
+            actor=user.id,
+            action="login_fail",
+            target=body.email,
+            ip=request.client.host if request.client else None,
+        )
         raise HTTPException(401, "invalid credentials")
     token = jwt.encode(
         {
@@ -133,7 +163,13 @@ async def login(body: LoginBody, request: Request, s: AsyncSession = Depends(db)
         JWT_SECRET,
         algorithm=JWT_ALG,
     )
-    await audit(s, actor=user.id, action="login_success", target=body.email, ip=request.client.host if request.client else None)
+    await audit(
+        s,
+        actor=user.id,
+        action="login_success",
+        target=body.email,
+        ip=request.client.host if request.client else None,
+    )
     return {"access_token": token, "token_type": "bearer", "role": user.role}
 
 

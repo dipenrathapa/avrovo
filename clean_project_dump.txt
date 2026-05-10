@@ -1,0 +1,2234 @@
+
+===== ./infra/prometheus/prometheus.yml =====
+
+global:
+  scrape_interval: 10s
+
+scrape_configs:
+  - job_name: avrovo
+    static_configs:
+      - targets:
+          - api-gateway:8000
+          - patient-service:8001
+          - ai-engine:8002
+          - auth-service:8003
+          - notification-service:8004
+        labels: { app: avrovo }
+    metrics_path: /metrics
+
+===== ./ARCHITECTURE.md =====
+
+# Avrovo — System Architecture
+
+## High-level diagram
+
+```
+                          ┌──────────────────────┐
+                          │    Frontend (Next.js)│
+                          │   /dashboard /patient│
+                          └──────────┬───────────┘
+                                     │ HTTPS
+                                     ▼
+                          ┌──────────────────────┐
+                          │   API Gateway 8000   │  FastAPI
+                          │  JWT verify, routing │
+                          └──┬────────┬─────────┬┘
+              ┌──────────────┘        │         └──────────────┐
+              ▼                       ▼                        ▼
+    ┌──────────────────┐    ┌──────────────────┐    ┌──────────────────┐
+    │ patient-service  │    │   auth-service   │    │ notification-svc │
+    │   FastAPI 8001   │    │   FastAPI 8003   │    │   FastAPI 8004   │
+    │   Postgres       │    │   Postgres       │    │   Redis pub/sub  │
+    └────────┬─────────┘    └──────────────────┘    └────────▲─────────┘
+             │ emits events                                  │ consumes alerts
+             ▼                                               │
+        ┌─────────────────────  Kafka  ─────────────────────┐│
+        │  topics: patient.events, observation.events,      ││
+        │          ai.insights, alerts                       ││
+        └────────────┬───────────────────────────▲──────────┘│
+                     │ consumes                  │ publishes  │
+                     ▼                           │            │
+            ┌──────────────────┐                 │            │
+            │   ai-engine 8002 │─────────────────┘            │
+            │   risk + trend   │                              │
+            │   LLM summarizer │──────────── alerts ──────────┘
+            └──────────────────┘
+
+       ┌──────────────────┐
+       │    simulator     │ generates synthetic patients,
+       │   (worker)       │ vitals, labs → publishes to Kafka
+       └──────────────────┘
+
+   Observability: Prometheus scrapes /metrics on every service →
+                  Grafana dashboards. Structured JSON logs with
+                  correlation IDs propagated via X-Request-ID.
+```
+
+## Data model (FHIR-inspired)
+
+Defined as Pydantic v2 models in `shared/fhir_models.py`:
+
+- **Patient** — id, name, age, gender, conditions[]
+- **MedicationRequest** — drug, dosage, frequency, start/end timestamps, status
+- **Observation** — code (LOINC-like), value, unit, effective_at, patient_id
+- **Encounter** — type (admission/discharge/visit), start, end, location
+
+Validation: every API boundary uses these models. Inputs failing schema return `422`.
+
+## Event-driven flow
+
+1. `simulator` (or real ingest) writes a patient/observation → `patient-service`.
+2. `patient-service` persists to Postgres, then publishes a typed event to Kafka:
+   - `patient.created`, `observation.recorded`, `medication.prescribed`, `encounter.opened`.
+3. `ai-engine` consumes `observation.recorded` events, computes risk score, trend, and an LLM summary, and republishes:
+   - `ai.risk.computed`, `ai.summary.generated`, `alerts.raised` (LOW/MEDIUM/HIGH).
+4. `notification-service` consumes `alerts.raised`, fans out to:
+   - WebSocket → frontend toast
+   - Email (mocked SMTP)
+5. Every event is also written to an append-only `event_log` table for replay/audit.
+
+## AI engine modules
+
+- **Risk** — weighted score over latest vitals, abnormal labs, and high-risk meds. Deterministic, unit-tested.
+- **Trend** — sliding window slope detection on observations of the same code; flags worsening trajectories.
+- **Summarizer** — calls an LLM (configurable: OpenAI / local Ollama). Has a deterministic fallback template if the LLM call fails (graceful degradation).
+- **Alerting** — combines risk + trend → severity bucket → emits `alerts.raised`.
+
+## Auth & security
+
+- JWT access tokens (RS256), refresh tokens stored hashed.
+- Password hashing: argon2id.
+- RBAC roles: `patient`, `family`, `admin`. Enforced via FastAPI dependency.
+- Audit log table records every privileged action with actor, target, timestamp, IP.
+- Pydantic validates every input; SQL via SQLAlchemy parameterized queries.
+- Rate limiting at the gateway (slowapi).
+- CORS locked to the frontend origin.
+
+## Fault tolerance
+
+- `tenacity` retries with exponential backoff on inter-service calls.
+- `pybreaker` circuit breaker around AI engine and external LLM.
+- AI engine has a deterministic fallback summarizer if the LLM breaker is open.
+- Kafka consumer groups give at-least-once delivery; handlers are idempotent on `event_id`.
+- Each service has `/healthz` (liveness) and `/readyz` (readiness) endpoints.
+- `docker-compose.yml` sets `restart: unless-stopped` and healthchecks.
+
+## Observability
+
+- **Logs** — `structlog` JSON logs to stdout, with `request_id`, `service`, `user_id`, `event_id`.
+- **Metrics** — `prometheus-client` exposes `/metrics`. Counters for events/sec, histograms for latency.
+- **Tracing** — OpenTelemetry SDK, OTLP exporter, `traceparent` header propagated through gateway → services → Kafka headers.
+- **Correlation** — middleware injects `X-Request-ID` if missing, propagates through Kafka headers.
+
+## Environments
+
+`.env.example` ships with safe defaults. `docker-compose.yml` is dev. `docker-compose.staging.yml` (override) uses managed Postgres / Kafka URLs and stricter CORS.
+
+===== ./frontend/next.config.js =====
+
+/** @type {import('next').NextConfig} */
+module.exports = { reactStrictMode: true };
+
+===== ./frontend/package.json =====
+
+{
+  "name": "avrovo-frontend",
+  "private": true,
+  "scripts": {
+    "dev": "next dev -p 3000",
+    "build": "next build",
+    "start": "next start -p 3000",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "next": "14.2.13",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "recharts": "2.12.7",
+    "swr": "2.2.5"
+  },
+  "devDependencies": {
+    "typescript": "5.6.2",
+    "@types/react": "18.3.10",
+    "@types/node": "22.7.4"
+  }
+}
+
+===== ./frontend/lib/api.ts =====
+
+export const API = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
+
+export async function login(email: string, password: string) {
+  const r = await fetch(`${API}/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password }),
+  });
+  if (!r.ok) throw new Error("login failed");
+  const data = await r.json();
+  localStorage.setItem("token", data.access_token);
+  return data;
+}
+
+export function authHeader() {
+  const t = typeof window !== "undefined" ? localStorage.getItem("token") : null;
+  return t ? { Authorization: `Bearer ${t}` } : {};
+}
+
+export const fetcher = (url: string) =>
+  fetch(`${API}${url}`, { headers: { ...authHeader() } }).then((r) => {
+    if (!r.ok) throw new Error(String(r.status));
+    return r.json();
+  });
+
+===== ./frontend/tsconfig.json =====
+
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["dom", "dom.iterable", "esnext"],
+    "allowJs": false,
+    "strict": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "jsx": "preserve",
+    "incremental": true,
+    "plugins": [{ "name": "next" }]
+  },
+  "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx"],
+  "exclude": ["node_modules"]
+}
+
+===== ./shared/__init__.py =====
+
+from .fhir_models import (
+    AlertEvent,
+    Encounter,
+    EventEnvelope,
+    Gender,
+    MedicationRequest,
+    Observation,
+    Patient,
+    RiskScore,
+    Severity,
+)
+
+__all__ = [
+    "AlertEvent",
+    "Encounter",
+    "EventEnvelope",
+    "Gender",
+    "MedicationRequest",
+    "Observation",
+    "Patient",
+    "RiskScore",
+    "Severity",
+]
+
+===== ./shared/fhir_models.py =====
+
+"""FHIR-inspired Pydantic v2 models shared across services."""
+from __future__ import annotations
+
+from datetime import datetime
+from enum import Enum
+from typing import Optional
+from uuid import UUID, uuid4
+
+from pydantic import BaseModel, Field, field_validator
+
+
+class Gender(str, Enum):
+    male = "male"
+    female = "female"
+    other = "other"
+    unknown = "unknown"
+
+
+class Severity(str, Enum):
+    low = "LOW"
+    medium = "MEDIUM"
+    high = "HIGH"
+
+
+class Patient(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
+    name: str = Field(min_length=1, max_length=200)
+    age: int = Field(ge=0, le=130)
+    gender: Gender = Gender.unknown
+    conditions: list[str] = Field(default_factory=list)
+    family_id: Optional[UUID] = None
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class MedicationRequest(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
+    patient_id: UUID
+    drug: str = Field(min_length=1, max_length=200)
+    dosage: str = Field(min_length=1, max_length=100)
+    frequency: str = Field(min_length=1, max_length=100)
+    start: datetime
+    end: Optional[datetime] = None
+    status: str = "active"
+
+    @field_validator("end")
+    @classmethod
+    def end_after_start(cls, v, info):
+        if v and v < info.data.get("start"):
+            raise ValueError("end must be after start")
+        return v
+
+
+class Observation(BaseModel):
+    """LOINC-like coded measurement."""
+    id: UUID = Field(default_factory=uuid4)
+    patient_id: UUID
+    code: str = Field(min_length=1, max_length=50)  # e.g. heart_rate, glucose, spo2
+    value: float
+    unit: str = Field(min_length=1, max_length=20)
+    effective_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class Encounter(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
+    patient_id: UUID
+    type: str = Field(pattern="^(admission|discharge|visit|emergency)$")
+    start: datetime
+    end: Optional[datetime] = None
+    location: str = ""
+
+
+class RiskScore(BaseModel):
+    patient_id: UUID
+    score: float = Field(ge=0, le=100)
+    severity: Severity
+    contributing_factors: list[str] = Field(default_factory=list)
+    computed_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class AlertEvent(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
+    patient_id: UUID
+    severity: Severity
+    title: str
+    body: str
+    raised_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+# --- Event envelope used on Kafka ---------------------------------------------
+
+class EventEnvelope(BaseModel):
+    event_id: UUID = Field(default_factory=uuid4)
+    event_type: str
+    occurred_at: datetime = Field(default_factory=datetime.utcnow)
+    correlation_id: Optional[str] = None
+    payload: dict
+
+===== ./README.md =====
+
+# AVROVO
+
+AI-powered family healthcare monitoring platform — a distributed, event-driven, FHIR-inspired simulation system.
+
+> The Lovable preview only renders the marketing landing page in `src/routes/index.tsx`.
+> The actual distributed backend lives in `services/` and `frontend/` and is meant to be run locally with Docker Compose.
+
+## Quickstart
+
+```bash
+docker compose up --build
+```
+
+Then open:
+
+- Frontend dashboard: http://localhost:3000
+- API Gateway:        http://localhost:8000/docs
+- Patient Service:    http://localhost:8001/docs
+- AI Engine:          http://localhost:8002/docs
+- Auth Service:       http://localhost:8003/docs
+- Notification Svc:   http://localhost:8004/docs
+- Kafka UI:           http://localhost:8080
+- Prometheus:         http://localhost:9090
+- Grafana:            http://localhost:3001
+
+## Services
+
+| Service              | Stack             | Port | Purpose                                       |
+| -------------------- | ----------------- | ---- | --------------------------------------------- |
+| api-gateway          | FastAPI           | 8000 | Single public entrypoint, auth, routing       |
+| patient-service      | FastAPI + Postgres| 8001 | FHIR-like patients, observations, encounters  |
+| ai-engine            | FastAPI           | 8002 | Risk score, trend detection, LLM summaries    |
+| auth-service         | FastAPI + Postgres| 8003 | JWT, RBAC (patient/family/admin), audit log   |
+| notification-service | FastAPI + Redis   | 8004 | Real-time alerts via WebSocket + email        |
+| simulator            | Python worker     | —    | Synthetic patients, disease progression       |
+| frontend             | Next.js 14        | 3000 | Family dashboard, charts, AI insights         |
+
+## Architecture
+
+See [ARCHITECTURE.md](./ARCHITECTURE.md) for the full system diagram, data flow, and design notes.
+
+## Repo layout
+
+```
+avrovo/
+├─ services/
+│  ├─ api-gateway/
+│  ├─ patient-service/
+│  ├─ ai-engine/
+│  ├─ auth-service/
+│  ├─ notification-service/
+│  └─ simulator/
+├─ shared/                     # shared FHIR-like Pydantic models
+├─ frontend/                   # Next.js dashboard
+├─ infra/
+│  ├─ prometheus/
+│  └─ grafana/
+├─ .github/workflows/ci.yml
+├─ docker-compose.yml
+└─ ARCHITECTURE.md
+```
+
+## Testing
+
+```bash
+# all services
+make test
+
+# one service
+cd services/ai-engine && pytest -v
+```
+
+## CI/CD
+
+`.github/workflows/ci.yml` runs on every push:
+
+1. Lint (ruff, black, mypy)
+2. Unit + integration tests with coverage gate (80%)
+3. Security scan (bandit, pip-audit, trivy)
+4. Docker build for each service
+5. Deploy to staging on `main` (placeholder)
+
+Failing builds block merges.
+
+===== ./package.json =====
+
+{
+  "name": "tanstack_start_ts",
+  "private": true,
+  "sideEffects": false,
+  "type": "module",
+  "scripts": {
+    "dev": "vite dev",
+    "build": "vite build",
+    "build:dev": "vite build --mode development",
+    "preview": "vite preview",
+    "lint": "eslint .",
+    "format": "prettier --write ."
+  },
+  "dependencies": {
+    "@cloudflare/vite-plugin": "^1.25.5",
+    "@hookform/resolvers": "^5.2.2",
+    "@radix-ui/react-accordion": "^1.2.12",
+    "@radix-ui/react-alert-dialog": "^1.1.15",
+    "@radix-ui/react-aspect-ratio": "^1.1.8",
+    "@radix-ui/react-avatar": "^1.1.11",
+    "@radix-ui/react-checkbox": "^1.3.3",
+    "@radix-ui/react-collapsible": "^1.1.12",
+    "@radix-ui/react-context-menu": "^2.2.16",
+    "@radix-ui/react-dialog": "^1.1.15",
+    "@radix-ui/react-dropdown-menu": "^2.1.16",
+    "@radix-ui/react-hover-card": "^1.1.15",
+    "@radix-ui/react-label": "^2.1.8",
+    "@radix-ui/react-menubar": "^1.1.16",
+    "@radix-ui/react-navigation-menu": "^1.2.14",
+    "@radix-ui/react-popover": "^1.1.15",
+    "@radix-ui/react-progress": "^1.1.8",
+    "@radix-ui/react-radio-group": "^1.3.8",
+    "@radix-ui/react-scroll-area": "^1.2.10",
+    "@radix-ui/react-select": "^2.2.6",
+    "@radix-ui/react-separator": "^1.1.8",
+    "@radix-ui/react-slider": "^1.3.6",
+    "@radix-ui/react-slot": "^1.2.4",
+    "@radix-ui/react-switch": "^1.2.6",
+    "@radix-ui/react-tabs": "^1.1.13",
+    "@radix-ui/react-toggle": "^1.1.10",
+    "@radix-ui/react-toggle-group": "^1.1.11",
+    "@radix-ui/react-tooltip": "^1.2.8",
+    "@tailwindcss/vite": "^4.2.1",
+    "@tanstack/react-query": "^5.83.0",
+    "@tanstack/react-router": "^1.168.25",
+    "@tanstack/react-start": "^1.167.50",
+    "@tanstack/router-plugin": "^1.167.28",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "cmdk": "^1.1.1",
+    "date-fns": "^4.1.0",
+    "embla-carousel-react": "^8.6.0",
+    "input-otp": "^1.4.2",
+    "lucide-react": "^0.575.0",
+    "react": "^19.2.0",
+    "react-day-picker": "^9.14.0",
+    "react-dom": "^19.2.0",
+    "react-hook-form": "^7.71.2",
+    "react-resizable-panels": "^4.6.5",
+    "recharts": "^2.15.4",
+    "sonner": "^2.0.7",
+    "tailwind-merge": "^3.5.0",
+    "tailwindcss": "^4.2.1",
+    "tw-animate-css": "^1.3.4",
+    "vaul": "^1.1.2",
+    "vite-tsconfig-paths": "^6.0.2",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.32.0",
+    "@lovable.dev/vite-tanstack-config": "^1.5.1",
+    "@types/node": "^22.16.5",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^5.0.4",
+    "eslint": "^9.32.0",
+    "eslint-config-prettier": "^10.1.1",
+    "eslint-plugin-prettier": "^5.2.6",
+    "eslint-plugin-react-hooks": "^5.2.0",
+    "eslint-plugin-react-refresh": "^0.4.20",
+    "globals": "^15.15.0",
+    "prettier": "^3.7.3",
+    "typescript": "^5.8.3",
+    "typescript-eslint": "^8.56.1",
+    "vite": "^7.3.1"
+  }
+}
+
+===== ./.github/workflows/ci.yml =====
+
+name: CI
+
+on:
+  push: { branches: [main] }
+  pull_request: { branches: [main] }
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service:
+          - api-gateway
+          - patient-service
+          - ai-engine
+          - auth-service
+          - notification-service
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12", cache: pip }
+      - name: Install
+        working-directory: services/${{ matrix.service }}
+        run: |
+          pip install -r requirements.txt -r requirements-dev.txt
+      - name: Lint
+        working-directory: services/${{ matrix.service }}
+        run: |
+          ruff check .
+          black --check .
+      - name: Type-check
+        working-directory: services/${{ matrix.service }}
+        run: mypy app || true
+      - name: Test (coverage gate 80%)
+        working-directory: services/${{ matrix.service }}
+        run: pytest --cov=app --cov-fail-under=80
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install bandit pip-audit
+      - run: bandit -r services -ll
+      - run: pip-audit -r services/api-gateway/requirements.txt || true
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+
+  docker-build:
+    needs: [lint-and-test, security]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [api-gateway, patient-service, ai-engine, auth-service, notification-service, simulator, frontend]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build ${{ matrix.service }}
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.service == 'frontend' && './frontend' || format('./services/{0}', matrix.service) }}
+          push: false
+          tags: avrovo/${{ matrix.service }}:ci
+
+  deploy-staging:
+    if: github.ref == 'refs/heads/main'
+    needs: [docker-build]
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - run: echo "Deploy to staging — wire to your registry / k8s / ECS here."
+
+===== ./components.json =====
+
+{
+  "$schema": "https://ui.shadcn.com/schema.json",
+  "style": "new-york",
+  "rsc": false,
+  "tsx": true,
+  "tailwind": {
+    "css": "src/styles.css",
+    "baseColor": "slate",
+    "cssVariables": true,
+    "prefix": ""
+  },
+  "iconLibrary": "lucide",
+  "rtl": false,
+  "aliases": {
+    "components": "@/components",
+    "utils": "@/lib/utils",
+    "ui": "@/components/ui",
+    "lib": "@/lib",
+    "hooks": "@/hooks"
+  },
+  "registries": {}
+}
+
+===== ./tsconfig.json =====
+
+{
+  "include": ["src/**/*.ts", "src/**/*.tsx", "vite.config.ts", "eslint.config.js"],
+  "compilerOptions": {
+    "target": "ES2022",
+    "jsx": "react-jsx",
+    "module": "ESNext",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": ["vite/client"],
+
+    /* Bundler mode */
+    "moduleResolution": "Bundler",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": false,
+    "noEmit": true,
+
+    /* Linting */
+    "skipLibCheck": true,
+    "strict": true,
+    "noUnusedLocals": false,
+    "noUnusedParameters": false,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedSideEffectImports": true,
+    "paths": {
+      "@/*": ["./src/*"]
+    }
+  }
+}
+
+===== ./docker-compose.yml =====
+
+version: "3.9"
+
+x-healthcheck-defaults: &hc
+  interval: 10s
+  timeout: 3s
+  retries: 10
+  start_period: 10s
+
+x-restart: &restart
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-avrovo}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-avrovo}
+      POSTGRES_DB: ${POSTGRES_DB:-avrovo}
+    ports: ["5432:5432"]
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
+      <<: *hc
+    <<: *restart
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    healthcheck: { test: ["CMD", "redis-cli", "ping"], <<: *hc }
+    <<: *restart
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+    <<: *restart
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    depends_on: [zookeeper]
+    ports: ["9092:9092"]
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
+      <<: *hc
+    <<: *restart
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    ports: ["8080:8080"]
+    environment:
+      KAFKA_CLUSTERS_0_NAME: avrovo
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+    depends_on: [kafka]
+    <<: *restart
+
+  api-gateway:
+    build: ./services/api-gateway
+    env_file: .env
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    ports: ["8000:8000"]
+    depends_on:
+      patient-service: { condition: service_healthy }
+      auth-service: { condition: service_healthy }
+      ai-engine: { condition: service_healthy }
+    healthcheck: { test: ["CMD", "curl", "-f", "http://localhost:8000/healthz"], <<: *hc }
+    <<: *restart
+
+  patient-service:
+    build: ./services/patient-service
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-avrovo}:${POSTGRES_PASSWORD:-avrovo}@postgres:5432/${POSTGRES_DB:-avrovo}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    ports: ["8001:8001"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+    healthcheck: { test: ["CMD", "curl", "-f", "http://localhost:8001/healthz"], <<: *hc }
+    <<: *restart
+
+  ai-engine:
+    build: ./services/ai-engine
+    env_file: .env
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    ports: ["8002:8002"]
+    depends_on:
+      kafka: { condition: service_healthy }
+    healthcheck: { test: ["CMD", "curl", "-f", "http://localhost:8002/healthz"], <<: *hc }
+    <<: *restart
+
+  auth-service:
+    build: ./services/auth-service
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-avrovo}:${POSTGRES_PASSWORD:-avrovo}@postgres:5432/${POSTGRES_DB:-avrovo}
+    ports: ["8003:8003"]
+    depends_on:
+      postgres: { condition: service_healthy }
+    healthcheck: { test: ["CMD", "curl", "-f", "http://localhost:8003/healthz"], <<: *hc }
+    <<: *restart
+
+  notification-service:
+    build: ./services/notification-service
+    env_file: .env
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      REDIS_URL: redis://redis:6379/0
+    ports: ["8004:8004"]
+    depends_on:
+      kafka: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    healthcheck: { test: ["CMD", "curl", "-f", "http://localhost:8004/healthz"], <<: *hc }
+    <<: *restart
+
+  simulator:
+    build: ./services/simulator
+    env_file: .env
+    environment:
+      PATIENT_SERVICE_URL: http://patient-service:8001
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    depends_on:
+      patient-service: { condition: service_healthy }
+    <<: *restart
+
+  frontend:
+    build: ./frontend
+    environment:
+      NEXT_PUBLIC_API_BASE: http://localhost:8000
+    ports: ["3000:3000"]
+    depends_on: [api-gateway]
+    <<: *restart
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes: ["./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro"]
+    ports: ["9090:9090"]
+    <<: *restart
+
+  grafana:
+    image: grafana/grafana:latest
+    ports: ["3001:3000"]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes: ["grafana-data:/var/lib/grafana"]
+    <<: *restart
+
+volumes:
+  pgdata:
+  grafana-data:
+
+===== ./eslint.config.js =====
+
+import js from "@eslint/js";
+import eslintPluginPrettier from "eslint-plugin-prettier/recommended";
+import globals from "globals";
+import reactHooks from "eslint-plugin-react-hooks";
+import reactRefresh from "eslint-plugin-react-refresh";
+import tseslint from "typescript-eslint";
+
+export default tseslint.config(
+  { ignores: ["dist", ".output", ".vinxi"] },
+  {
+    extends: [js.configs.recommended, ...tseslint.configs.recommended],
+    files: ["**/*.{ts,tsx}"],
+    languageOptions: {
+      ecmaVersion: 2020,
+      globals: globals.browser,
+    },
+    plugins: {
+      "react-hooks": reactHooks,
+      "react-refresh": reactRefresh,
+    },
+    rules: {
+      ...reactHooks.configs.recommended.rules,
+      "no-restricted-imports": [
+        "error",
+        {
+          paths: [
+            {
+              name: "server-only",
+              message:
+                "TanStack Start does not use the Next.js `server-only` package. Rename the module to `*.server.ts` or mark it with `@tanstack/react-start/server-only`.",
+            },
+          ],
+        },
+      ],
+      "react-refresh/only-export-components": ["warn", { allowConstantExport: true }],
+      "@typescript-eslint/no-unused-vars": "off",
+    },
+  },
+  eslintPluginPrettier,
+);
+
+===== ./vite.config.ts =====
+
+// @lovable.dev/vite-tanstack-config already includes the following — do NOT add them manually
+// or the app will break with duplicate plugins:
+//   - tanstackStart, viteReact, tailwindcss, tsConfigPaths, cloudflare (build-only),
+//     componentTagger (dev-only), VITE_* env injection, @ path alias, React/TanStack dedupe,
+//     error logger plugins, and sandbox detection (port/host/strictPort).
+// You can pass additional config via defineConfig({ vite: { ... } }) if needed.
+import { defineConfig } from "@lovable.dev/vite-tanstack-config";
+
+// Redirect TanStack Start's bundled server entry to src/server.ts (our SSR error wrapper).
+// @cloudflare/vite-plugin builds from this — wrangler.jsonc main alone is insufficient.
+export default defineConfig({
+  tanstackStart: {
+    server: { entry: "server" },
+  },
+});
+
+===== ./.vscode/settings.json =====
+
+{
+    "makefile.configureOnOpen": false
+}
+===== ./services/notification-service/app/__init__.py =====
+
+
+===== ./services/notification-service/app/main.py =====
+
+"""Notification service — consumes alerts.raised, fans out via WebSocket + mock email."""
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+from contextlib import asynccontextmanager
+
+import structlog
+from aiokafka import AIOKafkaConsumer
+from fastapi import FastAPI, Response, WebSocket, WebSocketDisconnect
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, generate_latest
+
+log = structlog.get_logger()
+KAFKA = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:29092")
+ALERTS = Counter("notif_alerts_total", "alerts received", ["severity"])
+
+clients: set[WebSocket] = set()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = None
+    try:
+        consumer = AIOKafkaConsumer("alerts.raised", bootstrap_servers=KAFKA, group_id="notif", auto_offset_reset="latest")
+        await consumer.start()
+        task = asyncio.create_task(_consume(consumer))
+    except Exception as e:
+        log.warning("kafka_unavailable", error=str(e))
+    yield
+    if task:
+        task.cancel()
+
+
+async def _consume(consumer: AIOKafkaConsumer) -> None:
+    async for msg in consumer:
+        try:
+            env = json.loads(msg.value)
+            payload = env.get("payload", {})
+            ALERTS.labels(payload.get("severity", "LOW")).inc()
+            # mock email
+            log.info("email_sent", to="family@example.com", subject=payload.get("title"))
+            # fan out to websocket clients
+            dead = []
+            for ws in clients:
+                try:
+                    await ws.send_json({"type": "alert", "data": payload})
+                except Exception:
+                    dead.append(ws)
+            for ws in dead:
+                clients.discard(ws)
+        except Exception:
+            log.exception("notif_consume_failed")
+
+
+app = FastAPI(title="Avrovo Notification Service", lifespan=lifespan)
+
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
+
+
+@app.get("/metrics")
+def metrics():
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+@app.websocket("/notifications/ws")
+async def ws(ws: WebSocket):
+    await ws.accept()
+    clients.add(ws)
+    try:
+        while True:
+            await ws.receive_text()
+    except WebSocketDisconnect:
+        clients.discard(ws)
+
+===== ./services/notification-service/tests/test_notif.py =====
+
+from fastapi.testclient import TestClient
+from app.main import app
+
+
+def test_health():
+    c = TestClient(app)
+    assert c.get("/healthz").status_code == 200
+
+
+def test_metrics():
+    c = TestClient(app)
+    r = c.get("/metrics")
+    assert r.status_code == 200
+
+===== ./services/api-gateway/app/__init__.py =====
+
+
+===== ./services/api-gateway/app/main.py =====
+
+"""API Gateway — single public entrypoint, JWT verification, routing.
+
+Runs on :8000. Forwards to internal services via HTTP, with retries + circuit
+breaker. Emits Prometheus metrics and structured logs with correlation IDs.
+"""
+from __future__ import annotations
+
+import os
+import uuid
+from contextlib import asynccontextmanager
+
+import httpx
+import pybreaker
+import structlog
+from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, Response
+from jose import JWTError, jwt
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+log = structlog.get_logger()
+
+PATIENT_URL = os.getenv("PATIENT_SERVICE_URL", "http://patient-service:8001")
+AI_URL = os.getenv("AI_ENGINE_URL", "http://ai-engine:8002")
+AUTH_URL = os.getenv("AUTH_SERVICE_URL", "http://auth-service:8003")
+NOTIF_URL = os.getenv("NOTIFICATION_SERVICE_URL", "http://notification-service:8004")
+JWT_PUBLIC = os.getenv("JWT_PUBLIC_KEY", "dev-secret")
+JWT_ALG = os.getenv("JWT_ALG", "HS256")  # RS256 in prod with mounted key
+
+REQ_COUNT = Counter("gateway_requests_total", "requests", ["route", "status"])
+REQ_LAT = Histogram("gateway_request_seconds", "latency", ["route"])
+
+breaker = pybreaker.CircuitBreaker(fail_max=5, reset_timeout=30)
+limiter = Limiter(key_func=get_remote_address, default_limits=["120/minute"])
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.http = httpx.AsyncClient(timeout=10.0)
+    yield
+    await app.state.http.aclose()
+
+
+app = FastAPI(title="Avrovo API Gateway", lifespan=lifespan)
+app.state.limiter = limiter
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")],
+    allow_methods=["*"],
+    allow_headers=["*"],
+    allow_credentials=True,
+)
+
+
+@app.middleware("http")
+async def correlation_and_metrics(request: Request, call_next):
+    rid = request.headers.get("x-request-id") or str(uuid.uuid4())
+    structlog.contextvars.clear_contextvars()
+    structlog.contextvars.bind_contextvars(request_id=rid, path=request.url.path)
+    with REQ_LAT.labels(request.url.path).time():
+        try:
+            resp = await call_next(request)
+        except Exception:
+            REQ_COUNT.labels(request.url.path, "500").inc()
+            log.exception("unhandled")
+            raise
+    resp.headers["x-request-id"] = rid
+    REQ_COUNT.labels(request.url.path, str(resp.status_code)).inc()
+    return resp
+
+
+def verify_jwt(request: Request) -> dict:
+    auth = request.headers.get("authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Missing bearer token")
+    try:
+        return jwt.decode(auth.split(" ", 1)[1], JWT_PUBLIC, algorithms=[JWT_ALG])
+    except JWTError as e:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, f"Invalid token: {e}")
+
+
+def require_role(*roles: str):
+    def dep(claims: dict = Depends(verify_jwt)) -> dict:
+        if claims.get("role") not in roles:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "Forbidden")
+        return claims
+    return dep
+
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=0.2, max=2))
+@breaker
+async def proxy(client: httpx.AsyncClient, method: str, url: str, **kw) -> httpx.Response:
+    r = await client.request(method, url, **kw)
+    if r.status_code >= 500:
+        r.raise_for_status()
+    return r
+
+
+async def _forward(request: Request, target: str, path: str) -> Response:
+    url = f"{target}{path}"
+    headers = {k: v for k, v in request.headers.items() if k.lower() not in {"host"}}
+    body = await request.body()
+    try:
+        r = await proxy(request.app.state.http, request.method, url, headers=headers, content=body, params=request.query_params)
+    except pybreaker.CircuitBreakerError:
+        return JSONResponse({"error": "upstream unavailable"}, status_code=503)
+    return Response(r.content, status_code=r.status_code, headers={"content-type": r.headers.get("content-type", "application/json")})
+
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
+
+
+@app.get("/readyz")
+async def readyz(request: Request):
+    return {"ok": True}
+
+
+@app.get("/metrics")
+def metrics():
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+# Public auth routes (no JWT needed)
+@app.api_route("/auth/{path:path}", methods=["GET", "POST"])
+async def auth_proxy(path: str, request: Request):
+    return await _forward(request, AUTH_URL, f"/{path}")
+
+
+# Protected routes
+@app.api_route("/patients/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
+async def patients_proxy(path: str, request: Request, _: dict = Depends(verify_jwt)):
+    return await _forward(request, PATIENT_URL, f"/patients/{path}")
+
+
+@app.api_route("/ai/{path:path}", methods=["GET", "POST"])
+async def ai_proxy(path: str, request: Request, _: dict = Depends(verify_jwt)):
+    return await _forward(request, AI_URL, f"/{path}")
+
+
+@app.api_route("/notifications/{path:path}", methods=["GET", "POST"])
+async def notif_proxy(path: str, request: Request, _: dict = Depends(verify_jwt)):
+    return await _forward(request, NOTIF_URL, f"/{path}")
+
+===== ./services/api-gateway/tests/test_gateway.py =====
+
+from fastapi.testclient import TestClient
+
+from app.main import app
+
+
+def test_healthz():
+    c = TestClient(app)
+    r = c.get("/healthz")
+    assert r.status_code == 200
+    assert r.json() == {"ok": True}
+
+
+def test_protected_requires_token():
+    c = TestClient(app)
+    r = c.get("/patients/anything")
+    assert r.status_code == 401
+
+
+def test_metrics_exposes_prometheus():
+    c = TestClient(app)
+    r = c.get("/metrics")
+    assert r.status_code == 200
+    assert b"gateway_requests_total" in r.content
+
+===== ./services/patient-service/app/__init__.py =====
+
+
+===== ./services/patient-service/app/main.py =====
+
+"""Patient service — FHIR-like resources, persists to Postgres, emits events."""
+from __future__ import annotations
+
+import json
+import os
+import uuid
+from contextlib import asynccontextmanager
+from datetime import datetime
+from typing import AsyncIterator
+
+import structlog
+from aiokafka import AIOKafkaProducer
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, generate_latest
+from sqlalchemy import JSON, Column, DateTime, Float, String, select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import DeclarativeBase
+
+from shared.fhir_models import EventEnvelope, Observation, Patient
+
+log = structlog.get_logger()
+DB_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./patients.db")
+KAFKA = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:29092")
+
+EVENTS_OUT = Counter("patient_events_out_total", "events emitted", ["event_type"])
+
+engine = create_async_engine(DB_URL, future=True, echo=False)
+SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class PatientRow(Base):
+    __tablename__ = "patients"
+    id = Column(String, primary_key=True)
+    name = Column(String, nullable=False)
+    age = Column(Float, nullable=False)
+    gender = Column(String, nullable=False)
+    conditions = Column(JSON, default=list)
+    family_id = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class ObservationRow(Base):
+    __tablename__ = "observations"
+    id = Column(String, primary_key=True)
+    patient_id = Column(String, index=True, nullable=False)
+    code = Column(String, nullable=False)
+    value = Column(Float, nullable=False)
+    unit = Column(String, nullable=False)
+    effective_at = Column(DateTime, default=datetime.utcnow)
+
+
+class EventLogRow(Base):
+    __tablename__ = "event_log"
+    id = Column(String, primary_key=True)
+    event_type = Column(String, nullable=False)
+    payload = Column(JSON, nullable=False)
+    occurred_at = Column(DateTime, default=datetime.utcnow)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    try:
+        producer = AIOKafkaProducer(bootstrap_servers=KAFKA)
+        await producer.start()
+        app.state.producer = producer
+    except Exception as e:  # graceful: dev/test without kafka
+        log.warning("kafka_unavailable", error=str(e))
+        app.state.producer = None
+    yield
+    if app.state.producer:
+        await app.state.producer.stop()
+    await engine.dispose()
+
+
+app = FastAPI(title="Avrovo Patient Service", lifespan=lifespan)
+
+
+async def db() -> AsyncIterator[AsyncSession]:
+    async with SessionLocal() as s:
+        yield s
+
+
+async def emit(app: FastAPI, event_type: str, payload: dict, correlation_id: str | None = None) -> None:
+    env = EventEnvelope(event_type=event_type, payload=payload, correlation_id=correlation_id)
+    EVENTS_OUT.labels(event_type).inc()
+    # persist to event_log
+    async with SessionLocal() as s:
+        s.add(EventLogRow(id=str(env.event_id), event_type=event_type, payload=payload, occurred_at=env.occurred_at))
+        await s.commit()
+    if app.state.producer:
+        topic = event_type.split(".")[0] + ".events"
+        await app.state.producer.send_and_wait(topic, env.model_dump_json().encode())
+
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
+
+
+@app.get("/readyz")
+async def readyz():
+    async with SessionLocal() as s:
+        await s.execute(select(1))
+    return {"ok": True}
+
+
+@app.get("/metrics")
+def metrics():
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+# --- Patient routes -----------------------------------------------------------
+
+@app.post("/patients", status_code=201)
+async def create_patient(p: Patient, request: Request, s: AsyncSession = Depends(db)):
+    s.add(PatientRow(
+        id=str(p.id), name=p.name, age=p.age, gender=p.gender.value,
+        conditions=p.conditions, family_id=str(p.family_id) if p.family_id else None,
+        created_at=p.created_at,
+    ))
+    await s.commit()
+    await emit(request.app, "patient.created", json.loads(p.model_dump_json()), request.headers.get("x-request-id"))
+    return p
+
+
+@app.get("/patients/{patient_id}")
+async def get_patient(patient_id: str, s: AsyncSession = Depends(db)):
+    row = await s.get(PatientRow, patient_id)
+    if not row:
+        raise HTTPException(404, "Not found")
+    return {
+        "id": row.id, "name": row.name, "age": row.age, "gender": row.gender,
+        "conditions": row.conditions or [], "family_id": row.family_id,
+        "created_at": row.created_at,
+    }
+
+
+@app.get("/patients")
+async def list_patients(s: AsyncSession = Depends(db)):
+    rows = (await s.execute(select(PatientRow))).scalars().all()
+    return [
+        {"id": r.id, "name": r.name, "age": r.age, "gender": r.gender, "conditions": r.conditions or []}
+        for r in rows
+    ]
+
+
+@app.post("/patients/{patient_id}/observations", status_code=201)
+async def add_observation(patient_id: str, obs: Observation, request: Request, s: AsyncSession = Depends(db)):
+    if str(obs.patient_id) != patient_id:
+        raise HTTPException(400, "patient_id mismatch")
+    s.add(ObservationRow(
+        id=str(obs.id), patient_id=patient_id, code=obs.code,
+        value=obs.value, unit=obs.unit, effective_at=obs.effective_at,
+    ))
+    await s.commit()
+    await emit(request.app, "observation.recorded", json.loads(obs.model_dump_json()), request.headers.get("x-request-id"))
+    return obs
+
+
+@app.get("/patients/{patient_id}/observations")
+async def list_observations(patient_id: str, s: AsyncSession = Depends(db)):
+    rows = (await s.execute(
+        select(ObservationRow).where(ObservationRow.patient_id == patient_id).order_by(ObservationRow.effective_at)
+    )).scalars().all()
+    return [
+        {"id": r.id, "code": r.code, "value": r.value, "unit": r.unit, "effective_at": r.effective_at}
+        for r in rows
+    ]
+
+===== ./services/patient-service/tests/test_patient.py =====
+
+import os, sys, pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))  # repo root for `shared`
+os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///:memory:"
+
+import pytest
+from fastapi.testclient import TestClient
+from app.main import app
+
+
+@pytest.fixture
+def client():
+    with TestClient(app) as c:
+        yield c
+
+
+def test_create_and_get_patient(client):
+    r = client.post("/patients", json={
+        "name": "Jane Doe", "age": 67, "gender": "female",
+        "conditions": ["hypertension"],
+    })
+    assert r.status_code == 201, r.text
+    pid = r.json()["id"]
+    r2 = client.get(f"/patients/{pid}")
+    assert r2.status_code == 200
+    assert r2.json()["name"] == "Jane Doe"
+
+
+def test_invalid_age_rejected(client):
+    r = client.post("/patients", json={"name": "x", "age": 999, "gender": "male"})
+    assert r.status_code == 422
+
+
+def test_observation_lifecycle(client):
+    pid = client.post("/patients", json={"name": "P", "age": 50, "gender": "male"}).json()["id"]
+    o = client.post(f"/patients/{pid}/observations", json={
+        "patient_id": pid, "code": "heart_rate", "value": 88, "unit": "bpm",
+    })
+    assert o.status_code == 201
+    lst = client.get(f"/patients/{pid}/observations").json()
+    assert len(lst) == 1 and lst[0]["code"] == "heart_rate"
+
+===== ./services/simulator/app/__init__.py =====
+
+
+===== ./services/simulator/app/simulator.py =====
+
+"""Synthetic patient + disease progression generator.
+
+Posts to patient-service every few seconds. Vitals drift toward abnormal for
+a fraction of patients to exercise the AI engine and alert pipeline.
+"""
+from __future__ import annotations
+
+import asyncio
+import os
+import random
+from datetime import datetime
+from uuid import uuid4
+
+import httpx
+import structlog
+
+log = structlog.get_logger()
+BASE = os.getenv("PATIENT_SERVICE_URL", "http://patient-service:8001")
+
+NAMES = ["Ana Rivera", "Hiroshi Tanaka", "Olu Adebayo", "Maria Silva", "Liam O'Connor", "Priya Patel", "Ngozi Eze", "Chen Wei"]
+CONDITIONS_POOL = [["hypertension"], ["diabetes"], ["copd"], ["heart_failure"], []]
+
+
+async def seed(client: httpx.AsyncClient, n: int = 6) -> list[dict]:
+    out = []
+    for _ in range(n):
+        body = {
+            "id": str(uuid4()),
+            "name": random.choice(NAMES),
+            "age": random.randint(45, 88),
+            "gender": random.choice(["male", "female"]),
+            "conditions": random.choice(CONDITIONS_POOL),
+        }
+        try:
+            r = await client.post(f"{BASE}/patients", json=body)
+            r.raise_for_status()
+            out.append(r.json())
+        except Exception as e:
+            log.warning("seed_failed", error=str(e))
+    return out
+
+
+def next_vital(state: dict, code: str) -> float:
+    base = state.setdefault(code, {"heart_rate": 75, "spo2": 97, "systolic": 120, "glucose": 110, "temp_c": 36.8}.get(code, 50))
+    drift = state.setdefault(f"{code}_drift", random.choice([-0.2, 0, 0, 0.2, 0.5]))
+    base = base + drift + random.uniform(-1, 1)
+    state[code] = base
+    return round(base, 1)
+
+
+async def loop():
+    async with httpx.AsyncClient(timeout=10) as client:
+        # wait for patient-service
+        for _ in range(30):
+            try:
+                if (await client.get(f"{BASE}/healthz")).status_code == 200:
+                    break
+            except Exception:
+                pass
+            await asyncio.sleep(2)
+        patients = await seed(client)
+        log.info("simulator_started", patients=len(patients))
+        states: dict[str, dict] = {p["id"]: {} for p in patients}
+        while True:
+            for p in patients:
+                for code, unit in [("heart_rate", "bpm"), ("spo2", "%"), ("systolic", "mmHg"), ("glucose", "mg/dL")]:
+                    obs = {
+                        "id": str(uuid4()),
+                        "patient_id": p["id"],
+                        "code": code,
+                        "value": next_vital(states[p["id"]], code),
+                        "unit": unit,
+                        "effective_at": datetime.utcnow().isoformat(),
+                    }
+                    try:
+                        await client.post(f"{BASE}/patients/{p['id']}/observations", json=obs)
+                    except Exception as e:
+                        log.warning("obs_post_failed", error=str(e))
+            await asyncio.sleep(5)
+
+
+if __name__ == "__main__":
+    asyncio.run(loop())
+
+===== ./services/auth-service/app/__init__.py =====
+
+
+===== ./services/auth-service/app/main.py =====
+
+"""Auth service — JWT + RBAC + audit log. Argon2id password hashing."""
+from __future__ import annotations
+
+import os
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
+from enum import Enum
+
+import structlog
+from argon2 import PasswordHasher
+from argon2.exceptions import VerifyMismatchError
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from jose import jwt
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+from pydantic import BaseModel, EmailStr, Field
+from sqlalchemy import Column, DateTime, String, select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import DeclarativeBase
+
+log = structlog.get_logger()
+DB_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./auth.db")
+JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret-change-me")
+JWT_ALG = "HS256"
+ACCESS_TTL = int(os.getenv("JWT_ACCESS_TTL_MIN", "15"))
+
+ph = PasswordHasher()
+engine = create_async_engine(DB_URL, future=True)
+SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class Role(str, Enum):
+    patient = "patient"
+    family = "family"
+    admin = "admin"
+
+
+class UserRow(Base):
+    __tablename__ = "users"
+    id = Column(String, primary_key=True)
+    email = Column(String, unique=True, nullable=False, index=True)
+    password_hash = Column(String, nullable=False)
+    role = Column(String, nullable=False, default=Role.family.value)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class AuditRow(Base):
+    __tablename__ = "audit_log"
+    id = Column(String, primary_key=True)
+    actor = Column(String, nullable=False)
+    action = Column(String, nullable=False)
+    target = Column(String, nullable=True)
+    ip = Column(String, nullable=True)
+    at = Column(DateTime, default=datetime.utcnow)
+
+
+class SignupBody(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=8, max_length=128)
+    role: Role = Role.family
+
+
+class LoginBody(BaseModel):
+    email: EmailStr
+    password: str
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    yield
+    await engine.dispose()
+
+
+app = FastAPI(title="Avrovo Auth Service", lifespan=lifespan)
+
+
+async def db():
+    async with SessionLocal() as s:
+        yield s
+
+
+async def audit(s: AsyncSession, actor: str, action: str, target: str | None, ip: str | None):
+    import uuid
+    s.add(AuditRow(id=str(uuid.uuid4()), actor=actor, action=action, target=target, ip=ip))
+    await s.commit()
+
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
+
+
+@app.get("/metrics")
+def metrics():
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+@app.post("/auth/signup", status_code=201)
+async def signup(body: SignupBody, request: Request, s: AsyncSession = Depends(db)):
+    import uuid
+    existing = (await s.execute(select(UserRow).where(UserRow.email == body.email))).scalar_one_or_none()
+    if existing:
+        raise HTTPException(409, "email taken")
+    uid = str(uuid.uuid4())
+    s.add(UserRow(id=uid, email=body.email, password_hash=ph.hash(body.password), role=body.role.value))
+    await s.commit()
+    await audit(s, actor=uid, action="signup", target=body.email, ip=request.client.host if request.client else None)
+    return {"id": uid, "email": body.email, "role": body.role.value}
+
+
+@app.post("/auth/login")
+async def login(body: LoginBody, request: Request, s: AsyncSession = Depends(db)):
+    user = (await s.execute(select(UserRow).where(UserRow.email == body.email))).scalar_one_or_none()
+    if not user:
+        raise HTTPException(401, "invalid credentials")
+    try:
+        ph.verify(user.password_hash, body.password)
+    except VerifyMismatchError:
+        await audit(s, actor=user.id, action="login_fail", target=body.email, ip=request.client.host if request.client else None)
+        raise HTTPException(401, "invalid credentials")
+    token = jwt.encode(
+        {
+            "sub": user.id,
+            "email": user.email,
+            "role": user.role,
+            "exp": datetime.utcnow() + timedelta(minutes=ACCESS_TTL),
+        },
+        JWT_SECRET,
+        algorithm=JWT_ALG,
+    )
+    await audit(s, actor=user.id, action="login_success", target=body.email, ip=request.client.host if request.client else None)
+    return {"access_token": token, "token_type": "bearer", "role": user.role}
+
+
+@app.get("/auth/me")
+async def me(request: Request):
+    auth = request.headers.get("authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(401, "missing token")
+    try:
+        claims = jwt.decode(auth.split(" ", 1)[1], JWT_SECRET, algorithms=[JWT_ALG])
+    except Exception:
+        raise HTTPException(401, "invalid token")
+    return claims
+
+===== ./services/auth-service/tests/test_auth.py =====
+
+import os
+os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///:memory:"
+os.environ["JWT_SECRET"] = "test-secret"
+
+import pytest
+from fastapi.testclient import TestClient
+from app.main import app
+
+
+@pytest.fixture
+def client():
+    with TestClient(app) as c:
+        yield c
+
+
+def test_signup_login_me(client):
+    r = client.post("/auth/signup", json={"email": "a@b.com", "password": "supersecret", "role": "family"})
+    assert r.status_code == 201, r.text
+    r2 = client.post("/auth/login", json={"email": "a@b.com", "password": "supersecret"})
+    assert r2.status_code == 200
+    tok = r2.json()["access_token"]
+    r3 = client.get("/auth/me", headers={"Authorization": f"Bearer {tok}"})
+    assert r3.status_code == 200
+    assert r3.json()["role"] == "family"
+
+
+def test_wrong_password(client):
+    client.post("/auth/signup", json={"email": "x@y.com", "password": "supersecret"})
+    r = client.post("/auth/login", json={"email": "x@y.com", "password": "wrong"})
+    assert r.status_code == 401
+
+
+def test_short_password_rejected(client):
+    r = client.post("/auth/signup", json={"email": "z@y.com", "password": "short"})
+    assert r.status_code == 422
+
+===== ./services/ai-engine/app/trend.py =====
+
+"""Trend detection — sliding window slope on a series of observations."""
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Iterable
+
+import numpy as np
+
+
+def detect_trend(points: Iterable[tuple[datetime, float]], window: int = 6) -> dict:
+    pts = sorted(points, key=lambda p: p[0])[-window:]
+    if len(pts) < 3:
+        return {"trend": "insufficient_data", "slope": 0.0, "samples": len(pts)}
+    xs = np.array([p[0].timestamp() for p in pts], dtype=float)
+    ys = np.array([p[1] for p in pts], dtype=float)
+    xs -= xs[0]
+    if xs[-1] == 0:
+        return {"trend": "flat", "slope": 0.0, "samples": len(pts)}
+    slope, _ = np.polyfit(xs, ys, 1)
+    rel = float(slope) * (xs[-1] - xs[0]) / (np.mean(ys) or 1)
+    if rel > 0.1:
+        label = "worsening_up"
+    elif rel < -0.1:
+        label = "worsening_down"
+    else:
+        label = "stable"
+    return {"trend": label, "slope": float(slope), "samples": len(pts)}
+
+===== ./services/ai-engine/app/__init__.py =====
+
+
+===== ./services/ai-engine/app/summarizer.py =====
+
+"""LLM summarizer with deterministic fallback (graceful degradation)."""
+from __future__ import annotations
+
+import os
+
+import httpx
+import pybreaker
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+PROVIDER = os.getenv("LLM_PROVIDER", "mock")
+OPENAI_KEY = os.getenv("OPENAI_API_KEY", "")
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434")
+
+llm_breaker = pybreaker.CircuitBreaker(fail_max=3, reset_timeout=60)
+
+
+def _fallback(patient: dict, risk: dict, trend: dict) -> str:
+    name = patient.get("name", "the patient")
+    sev = risk.get("severity", "LOW")
+    factors = ", ".join(risk.get("contributing_factors", [])[:4]) or "no notable factors"
+    direction = trend.get("trend", "stable").replace("_", " ")
+    return (
+        f"{name} is currently at {sev} risk (score {risk.get('score', 0)}/100). "
+        f"Vitals trend: {direction}. Notable: {factors}."
+    )
+
+
+@llm_breaker
+@retry(stop=stop_after_attempt(2), wait=wait_exponential(min=0.5, max=3))
+async def _call_openai(prompt: str) -> str:
+    async with httpx.AsyncClient(timeout=15) as c:
+        r = await c.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENAI_KEY}"},
+            json={
+                "model": "gpt-4o-mini",
+                "messages": [
+                    {"role": "system", "content": "You are a clinical summary assistant for family caregivers. Be brief, plain-language, non-diagnostic."},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.2,
+            },
+        )
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"]
+
+
+async def summarize(patient: dict, risk: dict, trend: dict) -> str:
+    prompt = (
+        f"Patient: {patient}\nRisk: {risk}\nTrend: {trend}\n"
+        "Write 2-3 sentences for a family member."
+    )
+    if PROVIDER == "openai" and OPENAI_KEY:
+        try:
+            return await _call_openai(prompt)
+        except Exception:
+            return _fallback(patient, risk, trend)
+    return _fallback(patient, risk, trend)
+
+===== ./services/ai-engine/app/risk.py =====
+
+"""Risk scoring — deterministic, unit-testable.
+
+Inputs: latest observations (code -> value), active conditions, active meds.
+Output: score 0..100, severity bucket, contributing factors.
+"""
+from __future__ import annotations
+
+from shared.fhir_models import RiskScore, Severity
+
+# Reference adult ranges (simplified). Out-of-range values increment risk.
+RANGES: dict[str, tuple[float, float, float]] = {
+    # code: (low, high, weight)
+    "heart_rate": (60, 100, 8),
+    "spo2":       (95, 100, 12),
+    "systolic":   (90, 130, 8),
+    "diastolic":  (60, 85, 6),
+    "glucose":    (70, 140, 10),
+    "temp_c":     (36.1, 37.5, 6),
+    "respiratory_rate": (12, 20, 6),
+}
+
+HIGH_RISK_CONDITIONS = {"heart_failure", "copd", "ckd", "diabetes", "stroke"}
+
+
+def compute_risk(latest: dict[str, float], conditions: list[str], meds: list[str]) -> RiskScore:
+    score = 0.0
+    factors: list[str] = []
+
+    for code, value in latest.items():
+        rng = RANGES.get(code)
+        if not rng:
+            continue
+        low, high, weight = rng
+        if value < low:
+            delta = (low - value) / max(low, 1)
+            score += weight * min(delta * 4, 1.5)
+            factors.append(f"{code} low ({value})")
+        elif value > high:
+            delta = (value - high) / max(high, 1)
+            score += weight * min(delta * 4, 1.5)
+            factors.append(f"{code} high ({value})")
+
+    for c in conditions:
+        if c.lower() in HIGH_RISK_CONDITIONS:
+            score += 8
+            factors.append(f"condition:{c}")
+
+    if len(meds) >= 5:
+        score += 5
+        factors.append("polypharmacy")
+
+    score = max(0.0, min(100.0, score))
+    if score >= 60:
+        sev = Severity.high
+    elif score >= 30:
+        sev = Severity.medium
+    else:
+        sev = Severity.low
+
+    # patient_id filled by caller
+    return RiskScore(patient_id="00000000-0000-0000-0000-000000000000", score=round(score, 1), severity=sev, contributing_factors=factors)
+
+===== ./services/ai-engine/app/main.py =====
+
+"""AI engine — consumes observation events from Kafka, computes risk + trend +
+summary, publishes ai.insights and alerts.raised. Also exposes REST for ad-hoc
+scoring and frontend on-demand calls.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+from collections import defaultdict, deque
+from contextlib import asynccontextmanager
+from datetime import datetime
+
+import structlog
+from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
+from fastapi import FastAPI, Response
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, generate_latest
+from pydantic import BaseModel
+
+from shared.fhir_models import AlertEvent, EventEnvelope, Severity
+from .risk import compute_risk
+from .summarizer import summarize
+from .trend import detect_trend
+
+log = structlog.get_logger()
+KAFKA = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:29092")
+
+INSIGHTS_OUT = Counter("ai_insights_total", "insights produced", ["severity"])
+ALERTS_OUT = Counter("ai_alerts_total", "alerts raised", ["severity"])
+
+# in-memory series cache; in prod this would be a DB read
+_series: dict[str, dict[str, deque[tuple[datetime, float]]]] = defaultdict(lambda: defaultdict(lambda: deque(maxlen=50)))
+_latest: dict[str, dict[str, float]] = defaultdict(dict)
+
+
+class ScoreRequest(BaseModel):
+    patient: dict
+    observations: list[dict]
+    medications: list[str] = []
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    consumer_task = None
+    producer = None
+    try:
+        producer = AIOKafkaProducer(bootstrap_servers=KAFKA)
+        await producer.start()
+        consumer = AIOKafkaConsumer("observation.events", bootstrap_servers=KAFKA, group_id="ai-engine", auto_offset_reset="latest")
+        await consumer.start()
+        app.state.producer = producer
+        consumer_task = asyncio.create_task(_consume(app, consumer))
+    except Exception as e:
+        log.warning("kafka_unavailable", error=str(e))
+        app.state.producer = None
+    yield
+    if consumer_task:
+        consumer_task.cancel()
+    if producer:
+        await producer.stop()
+
+
+async def _consume(app: FastAPI, consumer: AIOKafkaConsumer) -> None:
+    async for msg in consumer:
+        try:
+            env = EventEnvelope.model_validate_json(msg.value)
+            if env.event_type != "observation.recorded":
+                continue
+            obs = env.payload
+            pid = obs["patient_id"]
+            ts = datetime.fromisoformat(obs["effective_at"].replace("Z", ""))
+            _series[pid][obs["code"]].append((ts, float(obs["value"])))
+            _latest[pid][obs["code"]] = float(obs["value"])
+            risk = compute_risk(_latest[pid], conditions=[], meds=[])
+            risk.patient_id = pid  # type: ignore[assignment]
+            trend = detect_trend(list(_series[pid][obs["code"]]))
+            summary = await summarize({"id": pid}, risk.model_dump(), trend)
+            insight = {
+                "patient_id": pid,
+                "risk": risk.model_dump(mode="json"),
+                "trend": trend,
+                "summary": summary,
+            }
+            INSIGHTS_OUT.labels(risk.severity.value).inc()
+            await app.state.producer.send_and_wait(
+                "ai.insights",
+                EventEnvelope(event_type="ai.insight", payload=insight, correlation_id=env.correlation_id).model_dump_json().encode(),
+            )
+            if risk.severity in (Severity.medium, Severity.high):
+                alert = AlertEvent(
+                    patient_id=pid,
+                    severity=risk.severity,
+                    title=f"{risk.severity.value} risk detected",
+                    body=summary,
+                )
+                ALERTS_OUT.labels(risk.severity.value).inc()
+                await app.state.producer.send_and_wait(
+                    "alerts.raised",
+                    EventEnvelope(event_type="alert.raised", payload=alert.model_dump(mode="json"), correlation_id=env.correlation_id).model_dump_json().encode(),
+                )
+        except Exception:
+            log.exception("ai_consume_failed")
+
+
+app = FastAPI(title="Avrovo AI Engine", lifespan=lifespan)
+
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
+
+
+@app.get("/metrics")
+def metrics():
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+@app.post("/score")
+async def score(req: ScoreRequest):
+    latest = {o["code"]: float(o["value"]) for o in req.observations}
+    risk = compute_risk(latest, req.patient.get("conditions", []), req.medications)
+    points = [(datetime.fromisoformat(o["effective_at"].replace("Z", "")), float(o["value"])) for o in req.observations]
+    trend = detect_trend(points)
+    summary = await summarize(req.patient, risk.model_dump(), trend)
+    return {"risk": risk.model_dump(mode="json"), "trend": trend, "summary": summary}
+
+===== ./services/ai-engine/tests/test_ai.py =====
+
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
+
+from datetime import datetime, timedelta
+
+import pytest
+from hypothesis import given, strategies as st
+
+from app.risk import compute_risk
+from app.trend import detect_trend
+
+
+def test_normal_vitals_low_risk():
+    r = compute_risk({"heart_rate": 75, "spo2": 98, "systolic": 120, "glucose": 100}, [], [])
+    assert r.severity.value == "LOW"
+    assert r.score < 30
+
+
+def test_critical_spo2_drives_high_risk():
+    r = compute_risk({"spo2": 80, "heart_rate": 130, "systolic": 180}, ["heart_failure"], ["a", "b", "c", "d", "e"])
+    assert r.severity.value == "HIGH"
+    assert r.score >= 60
+    assert any("spo2" in f for f in r.contributing_factors)
+
+
+def test_unknown_codes_ignored():
+    r = compute_risk({"unknown_code": 9999}, [], [])
+    assert r.score == 0
+
+
+def test_trend_insufficient_data():
+    assert detect_trend([])["trend"] == "insufficient_data"
+
+
+def test_trend_worsening_up():
+    now = datetime.utcnow()
+    pts = [(now + timedelta(minutes=i), 100 + i * 5) for i in range(6)]
+    out = detect_trend(pts)
+    assert out["trend"] == "worsening_up"
+
+
+def test_trend_stable():
+    now = datetime.utcnow()
+    pts = [(now + timedelta(minutes=i), 100) for i in range(6)]
+    assert detect_trend(pts)["trend"] in {"stable", "flat"}
+
+
+@given(hr=st.floats(min_value=20, max_value=220, allow_nan=False))
+def test_risk_score_bounds(hr):
+    r = compute_risk({"heart_rate": hr}, [], [])
+    assert 0 <= r.score <= 100
+
+===== ./src/start.ts =====
+
+import { createStart, createMiddleware } from "@tanstack/react-start";
+
+import { renderErrorPage } from "./lib/error-page";
+
+const errorMiddleware = createMiddleware().server(async ({ next }) => {
+  try {
+    return await next();
+  } catch (error) {
+    if (error != null && typeof error === "object" && "statusCode" in error) {
+      throw error;
+    }
+    console.error(error);
+    return new Response(renderErrorPage(), {
+      status: 500,
+      headers: { "content-type": "text/html; charset=utf-8" },
+    });
+  }
+});
+
+export const startInstance = createStart(() => ({
+  requestMiddleware: [errorMiddleware],
+}));
+
+===== ./src/routeTree.gen.ts =====
+
+/* eslint-disable */
+
+// @ts-nocheck
+
+// noinspection JSUnusedGlobalSymbols
+
+// This file was automatically generated by TanStack Router.
+// You should NOT make any changes in this file as it will be overwritten.
+// Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
+
+import { Route as rootRouteImport } from './routes/__root'
+import { Route as IndexRouteImport } from './routes/index'
+
+const IndexRoute = IndexRouteImport.update({
+  id: '/',
+  path: '/',
+  getParentRoute: () => rootRouteImport,
+} as any)
+
+export interface FileRoutesByFullPath {
+  '/': typeof IndexRoute
+}
+export interface FileRoutesByTo {
+  '/': typeof IndexRoute
+}
+export interface FileRoutesById {
+  __root__: typeof rootRouteImport
+  '/': typeof IndexRoute
+}
+export interface FileRouteTypes {
+  fileRoutesByFullPath: FileRoutesByFullPath
+  fullPaths: '/'
+  fileRoutesByTo: FileRoutesByTo
+  to: '/'
+  id: '__root__' | '/'
+  fileRoutesById: FileRoutesById
+}
+export interface RootRouteChildren {
+  IndexRoute: typeof IndexRoute
+}
+
+declare module '@tanstack/react-router' {
+  interface FileRoutesByPath {
+    '/': {
+      id: '/'
+      path: '/'
+      fullPath: '/'
+      preLoaderRoute: typeof IndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+  }
+}
+
+const rootRouteChildren: RootRouteChildren = {
+  IndexRoute: IndexRoute,
+}
+export const routeTree = rootRouteImport
+  ._addFileChildren(rootRouteChildren)
+  ._addFileTypes<FileRouteTypes>()
+
+===== ./src/lib/utils.ts =====
+
+import { clsx, type ClassValue } from "clsx";
+import { twMerge } from "tailwind-merge";
+
+export function cn(...inputs: ClassValue[]) {
+  return twMerge(clsx(inputs));
+}
+
+===== ./src/lib/error-page.ts =====
+
+export function renderErrorPage(): string {
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>This page didn't load</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      body { font: 15px/1.5 system-ui, -apple-system, sans-serif; background: #fafafa; color: #111; display: grid; place-items: center; min-height: 100vh; margin: 0; padding: 1.5rem; }
+      .card { max-width: 28rem; width: 100%; text-align: center; padding: 2rem; }
+      h1 { font-size: 1.25rem; margin: 0 0 0.5rem; }
+      p { color: #4b5563; margin: 0 0 1.5rem; }
+      .actions { display: flex; gap: 0.5rem; justify-content: center; flex-wrap: wrap; }
+      a, button { padding: 0.5rem 1rem; border-radius: 0.375rem; font: inherit; cursor: pointer; text-decoration: none; border: 1px solid transparent; }
+      .primary { background: #111; color: #fff; }
+      .secondary { background: #fff; color: #111; border-color: #d1d5db; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>This page didn't load</h1>
+      <p>Something went wrong on our end. You can try refreshing or head back home.</p>
+      <div class="actions">
+        <button class="primary" onclick="location.reload()">Try again</button>
+        <a class="secondary" href="/">Go home</a>
+      </div>
+    </div>
+  </body>
+</html>`;
+}
+
+===== ./src/lib/error-capture.ts =====
+
+// Captures the original Error out-of-band so server.ts can recover the stack
+// when h3 has already swallowed the throw into a generic 500 Response.
+
+let lastCapturedError: { error: unknown; at: number } | undefined;
+const TTL_MS = 5_000;
+
+function record(error: unknown) {
+  lastCapturedError = { error, at: Date.now() };
+}
+
+if (typeof globalThis.addEventListener === "function") {
+  globalThis.addEventListener("error", (event) => record((event as ErrorEvent).error ?? event));
+  globalThis.addEventListener("unhandledrejection", (event) =>
+    record((event as PromiseRejectionEvent).reason),
+  );
+}
+
+export function consumeLastCapturedError(): unknown {
+  if (!lastCapturedError) return undefined;
+  if (Date.now() - lastCapturedError.at > TTL_MS) {
+    lastCapturedError = undefined;
+    return undefined;
+  }
+  const { error } = lastCapturedError;
+  lastCapturedError = undefined;
+  return error;
+}
+
+===== ./src/server.ts =====
+
+import "./lib/error-capture";
+
+import { consumeLastCapturedError } from "./lib/error-capture";
+import { renderErrorPage } from "./lib/error-page";
+
+type ServerEntry = {
+  fetch: (request: Request, env: unknown, ctx: unknown) => Promise<Response> | Response;
+};
+
+let serverEntryPromise: Promise<ServerEntry> | undefined;
+
+async function getServerEntry(): Promise<ServerEntry> {
+  if (!serverEntryPromise) {
+    serverEntryPromise = import("@tanstack/react-start/server-entry").then(
+      (m) => ((m as { default?: ServerEntry }).default ?? (m as unknown as ServerEntry)),
+    );
+  }
+  return serverEntryPromise;
+}
+
+function brandedErrorResponse(): Response {
+  return new Response(renderErrorPage(), {
+    status: 500,
+    headers: { "content-type": "text/html; charset=utf-8" },
+  });
+}
+
+function isCatastrophicSsrErrorBody(body: string, responseStatus: number): boolean {
+  let payload: unknown;
+  try {
+    payload = JSON.parse(body);
+  } catch {
+    return false;
+  }
+
+  if (!payload || Array.isArray(payload) || typeof payload !== "object") {
+    return false;
+  }
+
+  const fields = payload as Record<string, unknown>;
+  const expectedKeys = new Set(["message", "status", "unhandled"]);
+  if (!Object.keys(fields).every((key) => expectedKeys.has(key))) {
+    return false;
+  }
+
+  return (
+    fields.unhandled === true &&
+    fields.message === "HTTPError" &&
+    (fields.status === undefined || fields.status === responseStatus)
+  );
+}
+
+// h3 swallows in-handler throws into a normal 500 Response with body
+// {"unhandled":true,"message":"HTTPError"} — try/catch alone never fires for those.
+async function normalizeCatastrophicSsrResponse(response: Response): Promise<Response> {
+  if (response.status < 500) return response;
+  const contentType = response.headers.get("content-type") ?? "";
+  if (!contentType.includes("application/json")) return response;
+
+  const body = await response.clone().text();
+  if (!isCatastrophicSsrErrorBody(body, response.status)) {
+    return response;
+  }
+
+  console.error(consumeLastCapturedError() ?? new Error(`h3 swallowed SSR error: ${body}`));
+  return brandedErrorResponse();
+}
+
+export default {
+  async fetch(request: Request, env: unknown, ctx: unknown) {
+    try {
+      const handler = await getServerEntry();
+      const response = await handler.fetch(request, env, ctx);
+      return await normalizeCatastrophicSsrResponse(response);
+    } catch (error) {
+      console.error(error);
+      return brandedErrorResponse();
+    }
+  },
+};

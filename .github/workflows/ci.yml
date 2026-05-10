@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push: { branches: [main] }
+  pull_request: { branches: [main] }
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service:
+          - api-gateway
+          - patient-service
+          - ai-engine
+          - auth-service
+          - notification-service
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12", cache: pip }
+      - name: Install
+        working-directory: services/${{ matrix.service }}
+        run: |
+          pip install -r requirements.txt -r requirements-dev.txt
+      - name: Lint
+        working-directory: services/${{ matrix.service }}
+        run: |
+          ruff check .
+          black --check .
+      - name: Type-check
+        working-directory: services/${{ matrix.service }}
+        run: mypy app || true
+      - name: Test (coverage gate 80%)
+        working-directory: services/${{ matrix.service }}
+        run: pytest --cov=app --cov-fail-under=80
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install bandit pip-audit
+      - run: bandit -r services -ll
+      - run: pip-audit -r services/api-gateway/requirements.txt || true
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+
+  docker-build:
+    needs: [lint-and-test, security]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [api-gateway, patient-service, ai-engine, auth-service, notification-service, simulator, frontend]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build ${{ matrix.service }}
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.service == 'frontend' && './frontend' || format('./services/{0}', matrix.service) }}
+          push: false
+          tags: avrovo/${{ matrix.service }}:ci
+
+  deploy-staging:
+    if: github.ref == 'refs/heads/main'
+    needs: [docker-build]
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - run: echo "Deploy to staging — wire to your registry / k8s / ECS here."

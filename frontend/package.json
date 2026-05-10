@@ -1,0 +1,22 @@
+{
+  "name": "avrovo-frontend",
+  "private": true,
+  "scripts": {
+    "dev": "next dev -p 3000",
+    "build": "next build",
+    "start": "next start -p 3000",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "next": "14.2.13",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "recharts": "2.12.7",
+    "swr": "2.2.5"
+  },
+  "devDependencies": {
+    "typescript": "5.6.2",
+    "@types/react": "18.3.10",
+    "@types/node": "22.7.4"
+  }
+}

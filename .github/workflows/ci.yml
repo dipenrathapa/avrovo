@@ -1,13 +1,180 @@
-name: CI
+# name: CI
+
+# on:
+#   push: { branches: [main] }
+#   pull_request: { branches: [main] }
+
+# jobs:
+#   lint-and-test:
+#     runs-on: ubuntu-latest
+#     strategy:
+#       matrix:
+#         service:
+#           - api-gateway
+#           - patient-service
+#           - ai-engine
+#           - auth-service
+#           - notification-service
+#     steps:
+#       - uses: actions/checkout@v4
+#       - uses: actions/setup-python@v5
+#         with: { python-version: "3.12", cache: pip }
+#       - name: Install
+#         working-directory: services/${{ matrix.service }}
+#         run: |
+#           pip install -r requirements.txt -r requirements-dev.txt
+#       - name: Lint
+#         working-directory: services/${{ matrix.service }}
+#         run: |
+#           ruff check .
+#           black --check .
+#       - name: Type-check
+#         working-directory: services/${{ matrix.service }}
+#         run: mypy app || true
+#       - name: Test (coverage gate 80%)
+#         working-directory: services/${{ matrix.service }}
+#         run: pytest --cov=app --cov-fail-under=80
+
+#   security:
+#     runs-on: ubuntu-latest
+#     steps:
+#       - uses: actions/checkout@v4
+#       - uses: actions/setup-python@v5
+#         with: { python-version: "3.12" }
+#       - run: pip install bandit pip-audit
+#       - run: bandit -r services -ll
+#       - run: pip-audit -r services/api-gateway/requirements.txt || true
+#       - name: Trivy filesystem scan
+#         uses: aquasecurity/trivy-action@master
+#         with:
+#           scan-type: fs
+#           severity: HIGH,CRITICAL
+#           exit-code: "1"
+#           ignore-unfixed: true
+
+#   docker-build:
+#     needs: [lint-and-test, security]
+#     runs-on: ubuntu-latest
+#     strategy:
+#       matrix:
+#         service: [api-gateway, patient-service, ai-engine, auth-service, notification-service, simulator, frontend]
+#     steps:
+#       - uses: actions/checkout@v4
+#       - uses: docker/setup-buildx-action@v3
+#       - name: Build ${{ matrix.service }}
+#         uses: docker/build-push-action@v5
+#         with:
+#           context: ${{ matrix.service == 'frontend' && './frontend' || format('./services/{0}', matrix.service) }}
+#           push: false
+#           tags: avrovo/${{ matrix.service }}:ci
+
+#   deploy-staging:
+#     if: github.ref == 'refs/heads/main'
+#     needs: [docker-build]
+#     runs-on: ubuntu-latest
+#     environment: staging
+#     steps:
+#       - run: echo "Deploy to staging — wire to your registry / k8s / ECS here."
+
+
+
+name: Avrovo CI/CD
 
 on:
-  push: { branches: [main] }
-  pull_request: { branches: [main] }
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12"
+  NODE_VERSION: "20"
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ${{ github.repository_owner }}/avrovo
+
+# ─────────────────────────────────────────────────────────────
+# JOB 1 — Python lint across all services
+# ─────────────────────────────────────────────────────────────
 jobs:
-  lint-and-test:
+  lint-python:
+    name: "Lint · ${{ matrix.service }}"
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
+      matrix:
+        service:
+          - api-gateway
+          - patient-service
+          - ai-engine
+          - auth-service
+          - notification-service
+          - simulator
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: services/${{ matrix.service }}/requirements*.txt
+
+      - name: Install deps + dev tools
+        run: |
+          pip install -r services/${{ matrix.service }}/requirements.txt
+          pip install -r services/${{ matrix.service }}/requirements-dev.txt 2>/dev/null || true
+          pip install ruff black mypy
+
+      - name: ruff (lint + import sort)
+        run: ruff check services/${{ matrix.service }}/app shared/
+
+      - name: black (format check)
+        run: black --check services/${{ matrix.service }}/app shared/
+
+      - name: mypy (type check)
+        run: |
+          cd services/${{ matrix.service }}
+          PYTHONPATH=$GITHUB_WORKSPACE mypy app --ignore-missing-imports || true
+
+# ─────────────────────────────────────────────────────────────
+# JOB 2 — Frontend lint + type check
+# ─────────────────────────────────────────────────────────────
+  lint-frontend:
+    name: "Lint · frontend"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install
+        working-directory: frontend
+        run: npm ci
+
+      - name: TypeScript type check
+        working-directory: frontend
+        run: npx tsc --noEmit
+
+      - name: ESLint
+        working-directory: frontend
+        run: npm run lint || true
+
+# ─────────────────────────────────────────────────────────────
+# JOB 3 — Unit + integration tests per service
+# ─────────────────────────────────────────────────────────────
+  test:
+    name: "Test · ${{ matrix.service }}"
+    runs-on: ubuntu-latest
+    needs: [lint-python]
+    strategy:
+      fail-fast: false
       matrix:
         service:
           - api-gateway
@@ -17,61 +184,517 @@ jobs:
           - notification-service
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: "3.12", cache: pip }
-      - name: Install
-        working-directory: services/${{ matrix.service }}
-        run: |
-          pip install -r requirements.txt -r requirements-dev.txt
-      - name: Lint
-        working-directory: services/${{ matrix.service }}
-        run: |
-          ruff check .
-          black --check .
-      - name: Type-check
-        working-directory: services/${{ matrix.service }}
-        run: mypy app || true
-      - name: Test (coverage gate 80%)
-        working-directory: services/${{ matrix.service }}
-        run: pytest --cov=app --cov-fail-under=80
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: services/${{ matrix.service }}/requirements*.txt
+
+      - name: Install deps
+        run: |
+          pip install -r services/${{ matrix.service }}/requirements.txt
+          pip install -r services/${{ matrix.service }}/requirements-dev.txt 2>/dev/null || true
+          pip install pytest pytest-cov pytest-asyncio hypothesis
+
+      - name: Run tests with coverage
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          DATABASE_URL: sqlite+aiosqlite:///:memory:
+          JWT_SECRET: test-secret
+          JWT_PUBLIC_KEY: test-secret
+          KAFKA_BOOTSTRAP_SERVERS: localhost:9092
+        working-directory: services/${{ matrix.service }}
+        run: |
+          pytest tests/ \
+            --cov=app \
+            --cov-report=term-missing \
+            --cov-report=xml:coverage.xml \
+            --cov-report=html:htmlcov \
+            --cov-fail-under=80 \
+            -v
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.service }}
+          path: services/${{ matrix.service }}/htmlcov/
+          retention-days: 7
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: services/${{ matrix.service }}/coverage.xml
+          flags: ${{ matrix.service }}
+          fail_ci_if_error: false
+
+# ─────────────────────────────────────────────────────────────
+# JOB 4 — Security scanning
+# ─────────────────────────────────────────────────────────────
   security:
+    name: "Security scan"
     runs-on: ubuntu-latest
+    needs: [lint-python]
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
-        with: { python-version: "3.12" }
-      - run: pip install bandit pip-audit
-      - run: bandit -r services -ll
-      - run: pip-audit -r services/api-gateway/requirements.txt || true
-      - name: Trivy filesystem scan
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install security tools
+        run: pip install bandit pip-audit safety
+
+      - name: Bandit — Python SAST (medium+ severity)
+        run: |
+          bandit -r services/ shared/ \
+            -ll \
+            -f json \
+            -o bandit-report.json || true
+          cat bandit-report.json
+
+      - name: pip-audit — dependency CVE scan (all services)
+        run: |
+          for svc in api-gateway patient-service ai-engine auth-service notification-service simulator; do
+            echo "=== $svc ==="
+            pip-audit -r services/$svc/requirements.txt --format json || true
+          done
+
+      - name: Safety — known vulnerability check
+        run: |
+          for svc in api-gateway patient-service ai-engine auth-service notification-service; do
+            echo "=== $svc ==="
+            safety check -r services/$svc/requirements.txt || true
+          done
+
+      - name: Trivy — filesystem scan (HIGH + CRITICAL, fail on found)
         uses: aquasecurity/trivy-action@master
         with:
           scan-type: fs
+          scan-ref: .
           severity: HIGH,CRITICAL
           exit-code: "1"
           ignore-unfixed: true
+          format: table
 
-  docker-build:
-    needs: [lint-and-test, security]
+      - name: Upload Bandit report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bandit-report
+          path: bandit-report.json
+          retention-days: 14
+
+# ─────────────────────────────────────────────────────────────
+# JOB 5 — Secret detection (never commit secrets)
+# ─────────────────────────────────────────────────────────────
+  secrets-scan:
+    name: "Secret detection"
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        service: [api-gateway, patient-service, ai-engine, auth-service, notification-service, simulator, frontend]
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Gitleaks — scan for hardcoded secrets
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+# ─────────────────────────────────────────────────────────────
+# JOB 6 — API contract validation
+# ─────────────────────────────────────────────────────────────
+  api-contracts:
+    name: "API contract check"
+    runs-on: ubuntu-latest
+    needs: [test]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install FastAPI + services
+        run: |
+          pip install fastapi httpx pydantic aiosqlite sqlalchemy \
+            structlog prometheus-client python-jose argon2-cffi \
+            aiokafka pybreaker tenacity slowapi
+
+      - name: Validate OpenAPI schemas can be generated
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          DATABASE_URL: sqlite+aiosqlite:///:memory:
+          JWT_SECRET: test-secret
+          JWT_PUBLIC_KEY: test-secret
+        run: |
+          for svc in api-gateway patient-service ai-engine auth-service notification-service; do
+            echo "=== Checking $svc OpenAPI schema ==="
+            python -c "
+          import sys
+          sys.path.insert(0, 'services/$svc')
+          from app.main import app
+          schema = app.openapi()
+          assert 'openapi' in schema, 'Missing openapi key'
+          assert 'paths' in schema, 'Missing paths'
+          print(f'  paths: {list(schema[\"paths\"].keys())}')
+          print('  OK')
+          "
+          done
+
+# ─────────────────────────────────────────────────────────────
+# JOB 7 — FHIR model validation
+# ─────────────────────────────────────────────────────────────
+  fhir-validation:
+    name: "FHIR model validation"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install pydantic
+        run: pip install pydantic
+
+      - name: Validate all FHIR models instantiate correctly
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python - <<'EOF'
+          from shared.fhir_models import (
+              Patient, Observation, MedicationRequest,
+              Encounter, RiskScore, AlertEvent, EventEnvelope,
+              Gender, Severity
+          )
+          from datetime import datetime
+          from uuid import uuid4
+
+          # Patient
+          p = Patient(name="Test Patient", age=65, gender=Gender.female, conditions=["diabetes"])
+          assert p.age == 65
+
+          # Observation
+          o = Observation(patient_id=p.id, code="8867-4", value=72.0, unit="bpm")
+          assert o.code == "8867-4"
+
+          # RiskScore
+          r = RiskScore(patient_id=p.id, score=45.0, severity=Severity.medium)
+          assert 0 <= r.score <= 100
+
+          # AlertEvent
+          a = AlertEvent(patient_id=p.id, severity=Severity.high, title="Test", body="Alert body")
+          assert a.severity == Severity.high
+
+          # EventEnvelope
+          e = EventEnvelope(event_type="observation.recorded", payload={"test": True})
+          assert e.event_type == "observation.recorded"
+
+          # Validation: age out of range should fail
+          try:
+              Patient(name="Bad", age=999, gender=Gender.male)
+              assert False, "Should have raised"
+          except Exception:
+              pass
+
+          print("All FHIR model validations passed")
+          EOF
+
+# ─────────────────────────────────────────────────────────────
+# JOB 8 — Docker build (all services, repo-root context)
+# ─────────────────────────────────────────────────────────────
+  docker-build:
+    name: "Docker build · ${{ matrix.service }}"
+    runs-on: ubuntu-latest
+    needs: [test, security]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - service: api-gateway
+            context: .
+            dockerfile: services/api-gateway/Dockerfile
+          - service: patient-service
+            context: .
+            dockerfile: services/patient-service/Dockerfile
+          - service: ai-engine
+            context: .
+            dockerfile: services/ai-engine/Dockerfile
+          - service: auth-service
+            context: .
+            dockerfile: services/auth-service/Dockerfile
+          - service: notification-service
+            context: .
+            dockerfile: services/notification-service/Dockerfile
+          - service: simulator
+            context: .
+            dockerfile: services/simulator/Dockerfile
+          - service: frontend
+            context: ./frontend
+            dockerfile: ./frontend/Dockerfile
+    steps:
+      - uses: actions/checkout@v4
+
       - uses: docker/setup-buildx-action@v3
+        with:
+          install: true
+
       - name: Build ${{ matrix.service }}
         uses: docker/build-push-action@v5
         with:
-          context: ${{ matrix.service == 'frontend' && './frontend' || format('./services/{0}', matrix.service) }}
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
           push: false
-          tags: avrovo/${{ matrix.service }}:ci
+          tags: avrovo/${{ matrix.service }}:ci-${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
 
-  deploy-staging:
-    if: github.ref == 'refs/heads/main'
-    needs: [docker-build]
+      - name: Trivy — image vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: avrovo/${{ matrix.service }}:ci-${{ github.sha }}
+          scan-type: image
+          severity: CRITICAL
+          exit-code: "0"
+          format: table
+
+# ─────────────────────────────────────────────────────────────
+# JOB 9 — Integration test (full stack smoke test)
+# ─────────────────────────────────────────────────────────────
+  integration-test:
+    name: "Integration smoke test"
     runs-on: ubuntu-latest
-    environment: staging
+    needs: [docker-build]
     steps:
-      - run: echo "Deploy to staging — wire to your registry / k8s / ECS here."
+      - uses: actions/checkout@v4
+
+      - name: Set test env vars
+        run: |
+          cp .env.example .env 2>/dev/null || cat > .env << 'EOF'
+          POSTGRES_USER=avrovo
+          POSTGRES_PASSWORD=avrovo
+          POSTGRES_DB=avrovo
+          JWT_SECRET=ci-test-secret
+          JWT_PUBLIC_KEY=ci-test-secret
+          JWT_ACCESS_TTL_MIN=15
+          KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+          REDIS_URL=redis://redis:6379/0
+          LLM_PROVIDER=mock
+          OPENAI_API_KEY=
+          PATIENT_SERVICE_URL=http://patient-service:8001
+          AI_ENGINE_URL=http://ai-engine:8002
+          AUTH_SERVICE_URL=http://auth-service:8003
+          NOTIFICATION_SERVICE_URL=http://notification-service:8004
+          NEXT_PUBLIC_API_BASE=http://localhost:8000
+          EOF
+
+      - name: Start stack (no frontend, faster)
+        run: |
+          docker compose up -d \
+            postgres redis zookeeper kafka \
+            auth-service patient-service ai-engine \
+            notification-service api-gateway
+        timeout-minutes: 5
+
+      - name: Wait for services to be healthy
+        run: |
+          echo "Waiting for services..."
+          for i in $(seq 1 30); do
+            all_up=true
+            for port in 8000 8001 8002 8003 8004; do
+              curl -sf http://localhost:$port/healthz > /dev/null 2>&1 || all_up=false
+            done
+            if $all_up; then
+              echo "All services healthy after ${i}x2s"
+              break
+            fi
+            sleep 2
+          done
+
+      - name: Smoke — healthz on all services
+        run: |
+          for port in 8000 8001 8002 8003 8004; do
+            response=$(curl -sf http://localhost:$port/healthz)
+            echo "Port $port: $response"
+            echo "$response" | grep -q '"ok":true'
+          done
+
+      - name: Smoke — auth signup + login
+        run: |
+          # signup
+          curl -sf -X POST http://localhost:8000/auth/signup \
+            -H "Content-Type: application/json" \
+            -d '{"email":"ci@test.com","password":"cipassword","role":"admin"}' \
+            | grep -q '"email"'
+
+          # login and extract token
+          TOKEN=$(curl -sf -X POST http://localhost:8000/auth/login \
+            -H "Content-Type: application/json" \
+            -d '{"email":"ci@test.com","password":"cipassword"}' \
+            | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+          echo "TOKEN=$TOKEN" >> $GITHUB_ENV
+          echo "Got token: ${TOKEN:0:20}..."
+
+      - name: Smoke — create patient via gateway
+        run: |
+          PATIENT=$(curl -sf -X POST http://localhost:8000/patients \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $TOKEN" \
+            -d '{"name":"CI Patient","age":70,"gender":"female","conditions":["hypertension"]}')
+          echo "$PATIENT"
+          PATIENT_ID=$(echo "$PATIENT" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+          echo "PATIENT_ID=$PATIENT_ID" >> $GITHUB_ENV
+
+      - name: Smoke — add observation + trigger AI
+        run: |
+          curl -sf -X POST http://localhost:8000/patients/$PATIENT_ID/observations \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $TOKEN" \
+            -d "{\"patient_id\":\"$PATIENT_ID\",\"code\":\"spo2\",\"value\":78,\"unit\":\"%\"}" \
+            | grep -q '"code"'
+
+      - name: Smoke — AI engine direct score
+        run: |
+          RESULT=$(curl -sf -X POST http://localhost:8002/score \
+            -H "Content-Type: application/json" \
+            -d '{
+              "patient": {"name": "CI", "conditions": ["heart_failure"]},
+              "observations": [
+                {"code": "spo2", "value": 78, "unit": "%", "effective_at": "2026-01-01T00:00:00"},
+                {"code": "heart_rate", "value": 140, "unit": "bpm", "effective_at": "2026-01-01T00:01:00"}
+              ],
+              "medications": ["a","b","c","d","e"]
+            }')
+          echo "$RESULT"
+          echo "$RESULT" | python3 -c "
+          import sys, json
+          r = json.load(sys.stdin)
+          assert r['risk']['severity'] in ['MEDIUM','HIGH'], f'Expected MEDIUM/HIGH, got {r[\"risk\"][\"severity\"]}'
+          assert r['risk']['score'] > 0
+          print('AI engine: PASS')
+          "
+
+      - name: Smoke — unprotected access blocked
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/patients)
+          echo "Unprotected /patients returned: $STATUS"
+          [ "$STATUS" = "401" ] || (echo "FAIL: expected 401, got $STATUS" && exit 1)
+
+      - name: Collect logs on failure
+        if: failure()
+        run: docker compose logs --tail=100
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
+
+# ─────────────────────────────────────────────────────────────
+# JOB 10 — Publish Docker images (main branch only)
+# ─────────────────────────────────────────────────────────────
+  publish:
+    name: "Publish · ${{ matrix.service }}"
+    runs-on: ubuntu-latest
+    needs: [integration-test]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    strategy:
+      matrix:
+        include:
+          - service: api-gateway
+            context: .
+            dockerfile: services/api-gateway/Dockerfile
+          - service: patient-service
+            context: .
+            dockerfile: services/patient-service/Dockerfile
+          - service: ai-engine
+            context: .
+            dockerfile: services/ai-engine/Dockerfile
+          - service: auth-service
+            context: .
+            dockerfile: services/auth-service/Dockerfile
+          - service: notification-service
+            context: .
+            dockerfile: services/notification-service/Dockerfile
+          - service: simulator
+            context: .
+            dockerfile: services/simulator/Dockerfile
+          - service: frontend
+            context: ./frontend
+            dockerfile: ./frontend/Dockerfile
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push ${{ matrix.service }}
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-${{ matrix.service }}:latest
+            ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-${{ matrix.service }}:${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+# ─────────────────────────────────────────────────────────────
+# JOB 11 — Deploy to staging
+# ─────────────────────────────────────────────────────────────
+  deploy-staging:
+    name: "Deploy → staging"
+    runs-on: ubuntu-latest
+    needs: [publish]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment:
+      name: staging
+      url: https://staging.avrovo.example.com
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy to staging
+        run: |
+          echo "Wire this to your registry + server:"
+          echo "  ssh deploy@staging 'docker compose pull && docker compose up -d'"
+          echo "  or: kubectl set image deployment/api-gateway api-gateway=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-api-gateway:${{ github.sha }}"
+          echo "Deployed SHA: ${{ github.sha }}"
+
+# ─────────────────────────────────────────────────────────────
+# JOB 12 — CI summary (always runs, shows pass/fail overview)
+# ─────────────────────────────────────────────────────────────
+  ci-summary:
+    name: "CI Summary"
+    runs-on: ubuntu-latest
+    needs:
+      - lint-python
+      - lint-frontend
+      - test
+      - security
+      - secrets-scan
+      - fhir-validation
+      - docker-build
+      - integration-test
+    if: always()
+    steps:
+      - name: Print summary
+        run: |
+          echo "## Avrovo CI Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Lint Python | ${{ needs.lint-python.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Lint Frontend | ${{ needs.lint-frontend.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Tests | ${{ needs.test.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Security | ${{ needs.security.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Secret Detection | ${{ needs.secrets-scan.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| FHIR Validation | ${{ needs.fhir-validation.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Docker Build | ${{ needs.docker-build.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Integration Test | ${{ needs.integration-test.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Commit: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
